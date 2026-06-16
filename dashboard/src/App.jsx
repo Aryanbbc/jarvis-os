@@ -2,6 +2,73 @@ import { useEffect, useRef, useState } from "react";
 
 const API_BASE = "http://localhost:8000";
 
+const DEMO_METRICS = {
+  total_word_count: 135000,
+  file_count: 202,
+  readable_file_count: 202,
+  last_5_modified_files: [
+    {
+      name: "2026-06-16-ai-engineer-roadmap.md",
+      path: "reports/2026-06-16-ai-engineer-roadmap.md",
+      modified_at: "2026-06-16T18:45:00",
+      size_bytes: 4200,
+    },
+    {
+      name: "2026-06-16-python-calculator.md",
+      path: "reports/2026-06-16-python-calculator.md",
+      modified_at: "2026-06-16T18:38:00",
+      size_bytes: 2100,
+    },
+    {
+      name: "2026-06-16-daily-brief.md",
+      path: "daily/2026-06-16.md",
+      modified_at: "2026-06-16T18:20:00",
+      size_bytes: 1800,
+    },
+  ],
+};
+
+const DEMO_SKILLS = [
+  {
+    name: "coding",
+    trigger_words: ["code", "build", "fix", "debug", "create", "implement", "setup"],
+  },
+  {
+    name: "daily-brief",
+    trigger_words: ["today", "schedule", "agenda", "tasks", "daily brief"],
+  },
+  {
+    name: "research",
+    trigger_words: ["find", "search", "research", "investigate", "compare", "summarize"],
+  },
+];
+
+const DEMO_RECENT = [
+  {
+    title: "AI Engineer Roadmap",
+    date: "2026-06-16",
+    path: "reports/2026-06-16-ai-engineer-roadmap.md",
+    preview: "A practical roadmap for becoming an AI engineer with projects, DSA, ML basics, and portfolio strategy.",
+  },
+  {
+    title: "Python Calculator",
+    date: "2026-06-16",
+    path: "reports/2026-06-16-python-calculator.md",
+    preview: "A simple Python calculator with add, subtract, multiply, divide, and input validation.",
+  },
+  {
+    title: "Daily Brief",
+    date: "2026-06-16",
+    path: "daily/2026-06-16.md",
+    preview: "Today’s focus: build Jarvis OS foundation, connect skills, vault memory, dashboard, and voice.",
+  },
+];
+
+function demoCommandReply(command) {
+  return `Demo response for: "${command}". In local mode, this command is routed through Ollama, saved into the vault, and appears in the memory feed.`;
+}
+
+
 export default function App() {
   const [metrics, setMetrics] = useState(null);
   const [skills, setSkills] = useState([]);
@@ -30,7 +97,10 @@ export default function App() {
       setRecent(recentData.entries || []);
       setStatus("ONLINE");
     } catch {
-      setStatus("OFFLINE");
+      setMetrics(DEMO_METRICS);
+      setSkills(DEMO_SKILLS);
+      setRecent(DEMO_RECENT);
+      setStatus("DEMO");
     }
   }
 
@@ -61,7 +131,23 @@ export default function App() {
       setCommand("");
       loadData();
     } catch (err) {
-      setJarvisReply("Command failed. Check API server and Ollama.");
+      const demoReply = demoCommandReply(clean);
+      setJarvisReply(demoReply);
+      setRecent((current) => [
+        {
+          title: clean,
+          date: new Date().toISOString().slice(0, 10),
+          path: "demo/generated-command.md",
+          preview: demoReply,
+        },
+        ...current,
+      ]);
+      setMetrics((current) => ({
+        ...(current || DEMO_METRICS),
+        total_word_count: (current?.total_word_count || DEMO_METRICS.total_word_count) + clean.split(/\s+/).length + 40,
+        file_count: (current?.file_count || DEMO_METRICS.file_count) + 1,
+      }));
+      setStatus("DEMO");
     } finally {
       setCommandLoading(false);
     }
@@ -88,7 +174,7 @@ export default function App() {
   const wordCount = metrics?.total_word_count ?? 0;
   const fileCount = metrics?.file_count ?? 0;
   const skillCount = skills.length;
-  const health = status === "ONLINE" ? 96 : 0;
+  const health = status === "ONLINE" || status === "DEMO" ? 96 : 0;
 
   return (
     <main className="vault-page">
