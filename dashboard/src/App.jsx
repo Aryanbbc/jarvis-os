@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { demoMetrics, demoSkills, demoRecent, demoCommandReply } from "./demoData";
 
 const API_BASE = "http://localhost:8000";
 
@@ -64,9 +65,6 @@ const DEMO_RECENT = [
   },
 ];
 
-function demoCommandReply(command) {
-  return `Demo response for: "${command}". In local mode, this command is routed through Ollama, saved into the vault, and appears in the memory feed.`;
-}
 
 
 export default function App() {
