@@ -70,10 +70,10 @@ function demoCommandReply(command) {
 
 
 export default function App() {
-  const [metrics, setMetrics] = useState(null);
-  const [skills, setSkills] = useState([]);
-  const [recent, setRecent] = useState([]);
-  const [status, setStatus] = useState("CONNECTING");
+  const [metrics, setMetrics] = useState(DEMO_METRICS);
+  const [skills, setSkills] = useState(DEMO_SKILLS);
+  const [recent, setRecent] = useState(DEMO_RECENT);
+  const [status, setStatus] = useState("DEMO");
   const [time, setTime] = useState(new Date());
 
   const [command, setCommand] = useState("");
