@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { demoMetrics, demoSkills, demoRecent, demoCommandReply } from "./demoData";
 
 const API_BASE = "http://localhost:8000";
+const IS_DEMO_MODE = import.meta.env.VITE_DEMO_MODE === "true";
 
 const DEMO_METRICS = {
   total_word_count: 135000,
@@ -79,6 +80,14 @@ export default function App() {
   const [commandLoading, setCommandLoading] = useState(false);
 
   async function loadData() {
+    if (IS_DEMO_MODE) {
+      setMetrics(demoMetrics);
+      setSkills(demoSkills);
+      setRecent(demoRecent);
+      setStatus("DEMO");
+      return;
+    }
+
     try {
       const [metricsRes, skillsRes, recentRes] = await Promise.all([
         fetch(`${API_BASE}/metrics`),
@@ -106,6 +115,28 @@ export default function App() {
     const clean = command.trim();
 
     if (!clean || commandLoading) return;
+
+    if (IS_DEMO_MODE) {
+      const demoReply = demoCommandReply(clean);
+      setJarvisReply(demoReply);
+      setRecent((current) => [
+        {
+          title: clean,
+          date: new Date().toISOString().slice(0, 10),
+          path: "demo/generated-command.md",
+          preview: demoReply,
+        },
+        ...current,
+      ]);
+      setMetrics((current) => ({
+        ...(current || demoMetrics),
+        total_word_count: (current?.total_word_count || demoMetrics.total_word_count) + 40,
+        file_count: (current?.file_count || demoMetrics.file_count) + 1,
+      }));
+      setCommand("");
+      setStatus("DEMO");
+      return;
+    }
 
     setCommandLoading(true);
     setJarvisReply("Thinking locally...");
