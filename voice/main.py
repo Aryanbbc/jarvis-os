@@ -1,0 +1,645 @@
+import os
+import re
+import wave
+import time
+import shutil
+import tempfile
+import subprocess
+from pathlib import Path
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import sounddevice as sd
+from dotenv import load_dotenv
+from faster_whisper import WhisperModel
+
+
+BASE_DIR = Path(__file__).resolve().parents[1]
+ENV_PATH = BASE_DIR / ".env"
+
+load_dotenv(ENV_PATH)
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
+
+VAULT_PATH = Path(os.getenv("VAULT_PATH", "./vault"))
+SKILLS_PATH = Path(os.getenv("SKILLS_PATH", "./skills"))
+
+if not VAULT_PATH.is_absolute():
+    VAULT_PATH = BASE_DIR / VAULT_PATH
+
+if not SKILLS_PATH.is_absolute():
+    SKILLS_PATH = BASE_DIR / SKILLS_PATH
+
+REPORTS_DIR = VAULT_PATH / "reports"
+DAILY_DIR = VAULT_PATH / "daily"
+AUDIO_DIR = VAULT_PATH / "audio"
+TRANSCRIPTS_DIR = VAULT_PATH / "transcripts"
+
+for folder in [REPORTS_DIR, DAILY_DIR, AUDIO_DIR, TRANSCRIPTS_DIR]:
+    folder.mkdir(parents=True, exist_ok=True)
+
+if not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY missing. Add it inside .env file.")
+
+
+SAMPLE_RATE = 16000
+CHANNELS = 1
+RECORD_SECONDS = 6
+
+WHISPER_MODEL_SIZE = "base"
+WHISPER_DEVICE = "cpu"
+WHISPER_COMPUTE_TYPE = "int8"
+
+EXIT_WORDS = {"exit", "quit", "stop", "shutdown", "goodbye", "bye"}
+WAKE_WORDS = {"jarvis", "hey jarvis", "ok jarvis", "okay jarvis"}
+EXIT_PHRASES = {"that is it", "that's it", "see you later", "stop listening", "shut down", "go to sleep"}
+
+
+def today_str() -> str:
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def timestamp_str() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def slugify(text: str, max_len: int = 64) -> str:
+    text = text.lower().strip()
+    text = re.sub(r"[^a-z0-9\s-]", "", text)
+    text = re.sub(r"\s+", "-", text)
+    text = re.sub(r"-+", "-", text)
+    text = text.strip("-")
+
+    if not text:
+        text = "untitled"
+
+    return text[:max_len].strip("-") or "untitled"
+
+
+def count_words(text: str) -> int:
+    return len(re.findall(r"\b\w+\b", text))
+
+
+def write_wav(path: Path, audio: np.ndarray, sample_rate: int = SAMPLE_RATE) -> None:
+    audio = np.asarray(audio)
+
+    if audio.ndim > 1:
+        audio = audio[:, 0]
+
+    if audio.dtype != np.int16:
+        audio = np.clip(audio, -1.0, 1.0)
+        audio = (audio * 32767).astype(np.int16)
+
+    with wave.open(str(path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(audio.tobytes())
+
+
+def read_wav(path: Path) -> Tuple[np.ndarray, int]:
+    with wave.open(str(path), "rb") as wf:
+        channels = wf.getnchannels()
+        sample_width = wf.getsampwidth()
+        sample_rate = wf.getframerate()
+        frames = wf.readframes(wf.getnframes())
+
+    if sample_width == 2:
+        audio = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+    elif sample_width == 4:
+        audio = np.frombuffer(frames, dtype=np.int32).astype(np.float32) / 2147483648.0
+    else:
+        audio = np.frombuffer(frames, dtype=np.uint8).astype(np.float32)
+        audio = (audio - 128.0) / 128.0
+
+    if channels > 1:
+        audio = audio.reshape(-1, channels).mean(axis=1)
+
+    return audio, sample_rate
+
+
+def record_audio() -> Path:
+    print("\nListening... speak now.")
+
+    audio = sd.rec(
+        int(RECORD_SECONDS * SAMPLE_RATE),
+        samplerate=SAMPLE_RATE,
+        channels=CHANNELS,
+        dtype="float32",
+    )
+
+    sd.wait()
+
+    path = AUDIO_DIR / f"input-{datetime.now().strftime('%Y%m%d-%H%M%S')}.wav"
+    write_wav(path, audio.flatten(), SAMPLE_RATE)
+
+    return path
+
+
+def transcribe_audio(model: WhisperModel, audio_path: Path) -> str:
+    segments, _ = model.transcribe(
+        str(audio_path),
+        beam_size=5,
+        language="en",
+        vad_filter=True,
+    )
+
+    text = " ".join(segment.text.strip() for segment in segments).strip()
+
+    transcript_path = TRANSCRIPTS_DIR / f"{today_str()}.md"
+
+    with transcript_path.open("a", encoding="utf-8") as f:
+        f.write(f"\n## {timestamp_str()}\n\n{text}\n")
+
+    return text
+
+
+def parse_skill_file(skill_path: Path) -> Dict[str, object]:
+    content = skill_path.read_text(encoding="utf-8")
+    name = skill_path.parent.name
+    triggers: List[str] = []
+
+    trigger_match = re.search(
+        r"##\s*Trigger Words\s*(.*?)(?:\n##\s|\Z)",
+        content,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    if trigger_match:
+        block = trigger_match.group(1)
+
+        for line in block.splitlines():
+            line = line.strip()
+
+            if line.startswith("-"):
+                trigger = line.lstrip("-").strip().lower()
+
+                if trigger:
+                    triggers.append(trigger)
+
+    return {
+        "name": name,
+        "path": skill_path,
+        "content": content,
+        "triggers": triggers,
+    }
+
+
+def load_skills() -> Dict[str, Dict[str, object]]:
+    skills: Dict[str, Dict[str, object]] = {}
+
+    if not SKILLS_PATH.exists():
+        return skills
+
+    for skill_file in SKILLS_PATH.glob("*/SKILL.md"):
+        skill = parse_skill_file(skill_file)
+        skills[str(skill["name"])] = skill
+
+    return skills
+
+
+def route_skill(user_text: str, skills: Dict[str, Dict[str, object]]) -> Optional[Dict[str, object]]:
+    lowered = user_text.lower()
+
+    best_skill = None
+    best_score = 0
+
+    for skill in skills.values():
+        score = 0
+
+        for trigger in skill.get("triggers", []):
+            trigger = str(trigger).lower().strip()
+
+            if not trigger:
+                continue
+
+            if " " in trigger:
+                if trigger in lowered:
+                    score += 2
+            else:
+                if re.search(rf"\b{re.escape(trigger)}\b", lowered):
+                    score += 1
+
+        if score > best_score:
+            best_skill = skill
+            best_score = score
+
+    return best_skill
+
+
+def read_daily_note() -> str:
+    path = DAILY_DIR / f"{today_str()}.md"
+
+    if not path.exists():
+        path.write_text(
+            f"""# Daily Note: {today_str()}
+
+## Today’s Focus
+No focus added yet.
+
+## Schedule
+- No events added yet.
+
+## Tasks
+- [ ] Add today's first task
+
+## Notes
+No notes yet.
+
+## Priorities
+1. Decide the main priority for today.
+
+## End-of-Day Recap
+Pending.
+""",
+            encoding="utf-8",
+        )
+
+    return path.read_text(encoding="utf-8")
+
+
+def call_openai(system_prompt: str, user_prompt: str) -> str:
+    import requests
+
+    prompt = f"""
+SYSTEM:
+{system_prompt.strip()}
+
+USER:
+{user_prompt.strip()}
+"""
+
+    try:
+        response = requests.post(
+            "http://localhost:11434/api/generate",
+            json={
+                "model": "gemma3:1b",
+                "prompt": prompt,
+                "stream": False,
+            },
+            timeout=180,
+        )
+
+        response.raise_for_status()
+        data = response.json()
+        reply = data.get("response", "").strip()
+
+        if not reply:
+            return "I processed that locally, but the model returned an empty response."
+
+        return reply
+
+    except requests.exceptions.ConnectionError:
+        return "Ollama is not running. Open the Ollama app, then try again."
+
+    except Exception as exc:
+        return f"Local Ollama error: {exc}"
+
+def update_vault_index(file_path: Path, response_text: str) -> None:
+    index_path = VAULT_PATH / "index.md"
+    relative_path = file_path.relative_to(VAULT_PATH)
+    date = today_str()
+    words = count_words(response_text)
+
+    entry = f"| {date} | [{relative_path.as_posix()}]({relative_path.as_posix()}) | Auto-saved GPT response | {words} |\n"
+
+    if not index_path.exists():
+        index_path.write_text(
+            f"""# Jarvis OS Vault Index
+
+## Vault Summary
+- Vault Name: jarvis-os
+- Last Updated: {date}
+
+## Reports
+
+| Date | File | Topic | Word Count |
+|---|---|---|---:|
+{entry}""",
+            encoding="utf-8",
+        )
+        return
+
+    content = index_path.read_text(encoding="utf-8")
+
+    if "## Reports" not in content:
+        content += "\n\n## Reports\n\n| Date | File | Topic | Word Count |\n|---|---|---|---:|\n"
+
+    content = re.sub(
+        r"- Last Updated:\s*.*",
+        f"- Last Updated: {date}",
+        content,
+    )
+
+    content = content.rstrip() + "\n" + entry
+
+    index_path.write_text(content, encoding="utf-8")
+
+
+def save_gpt_response(user_text: str, response_text: str, skill_name: Optional[str] = None) -> Path:
+    date = today_str()
+    topic = slugify(user_text)
+    path = REPORTS_DIR / f"{date}-{topic}.md"
+
+    counter = 2
+
+    while path.exists():
+        path = REPORTS_DIR / f"{date}-{topic}-{counter}.md"
+        counter += 1
+
+    title = skill_name.title() if skill_name else "GPT Response"
+
+    content = f"""# {title}: {user_text.strip()}
+
+Date: {date}
+Time: {timestamp_str()}
+Skill: {skill_name or "general"}
+
+## User Request
+{user_text.strip()}
+
+## Response
+{response_text.strip()}
+"""
+
+    path.write_text(content, encoding="utf-8")
+    update_vault_index(path, response_text)
+
+    return path
+
+
+def handle_research_skill(user_text: str, skill: Dict[str, object]) -> str:
+    system_prompt = f"""
+You are Jarvis OS Research Skill.
+
+Follow this skill file exactly:
+
+{skill["content"]}
+
+Create a useful research-style report.
+If live web browsing is unavailable, clearly state that current facts should be verified.
+"""
+
+    return call_openai(system_prompt, user_text)
+
+
+def handle_coding_skill(user_text: str, skill: Dict[str, object]) -> str:
+    system_prompt = f"""
+You are Jarvis OS Coding Skill.
+
+Follow this skill file exactly:
+
+{skill["content"]}
+
+Write complete, practical, runnable code when the user asks for code.
+Avoid placeholders unless absolutely necessary.
+"""
+
+    return call_openai(system_prompt, user_text)
+
+
+def handle_daily_brief_skill(user_text: str, skill: Dict[str, object]) -> str:
+    daily_note = read_daily_note()
+
+    system_prompt = f"""
+You are Jarvis OS Daily Brief Skill.
+
+Follow this skill file exactly:
+
+{skill["content"]}
+
+Read the daily note and produce a clear daily brief.
+"""
+
+    user_prompt = f"""
+User request:
+{user_text}
+
+Current daily note:
+{daily_note}
+"""
+
+    return call_openai(system_prompt, user_prompt)
+
+
+def handle_general(user_text: str) -> str:
+    system_prompt = """
+You are Jarvis OS, a local AI operating system assistant.
+Be useful, direct, practical, and concise.
+"""
+
+    return call_openai(system_prompt, user_text)
+
+
+class KokoroSpeaker:
+    def __init__(self) -> None:
+        self.pipeline = None
+        self.mode = None
+
+        try:
+            from kokoro import KPipeline
+
+            self.pipeline = KPipeline(lang_code="a")
+            self.mode = "python"
+        except Exception:
+            self.pipeline = None
+            self.mode = "cli" if shutil.which("kokoro-tts") else None
+
+    def speak(self, text: str) -> None:
+        clean_text = self.clean_text(text)
+
+        if not clean_text:
+            return
+
+        if self.mode == "python" and self.pipeline is not None:
+            self.speak_python(clean_text)
+            return
+
+        if self.mode == "cli":
+            self.speak_cli(clean_text)
+            return
+
+        print("Kokoro TTS not available. Reply printed only.")
+
+    def clean_text(self, text: str) -> str:
+        text = re.sub(r"```.*?```", "Code block omitted from speech.", text, flags=re.DOTALL)
+        text = re.sub(r"`([^`]*)`", r"\1", text)
+        text = re.sub(r"\[(.*?)\]\(.*?\)", r"\1", text)
+        text = re.sub(r"#+\s*", "", text)
+        text = re.sub(r"[*_>\-]{1,}", " ", text)
+        text = re.sub(r"\s+", " ", text).strip()
+
+        return text[:1500]
+
+    def speak_python(self, text: str) -> None:
+        try:
+            generator = self.pipeline(
+                text,
+                voice="af_heart",
+                speed=1.0,
+                split_pattern=r"\n+",
+            )
+
+            for _, _, audio in generator:
+                if hasattr(audio, "detach"):
+                    audio = audio.detach().cpu().numpy()
+
+                audio = np.asarray(audio, dtype=np.float32)
+                sd.play(audio, 24000)
+                sd.wait()
+
+        except Exception as exc:
+            print(f"Kokoro Python TTS failed: {exc}")
+
+    def speak_cli(self, text: str) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            input_path = tmpdir_path / "speech.txt"
+            output_path = tmpdir_path / "speech.wav"
+
+            input_path.write_text(text, encoding="utf-8")
+
+            command = [
+                "kokoro-tts",
+                str(input_path),
+                str(output_path),
+                "--speed",
+                "1.0",
+                "--lang",
+                "en-us",
+                "--voice",
+                "af_sarah",
+            ]
+
+            try:
+                subprocess.run(
+                    command,
+                    cwd=str(BASE_DIR),
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=True,
+                )
+
+                if output_path.exists():
+                    audio, sample_rate = read_wav(output_path)
+                    sd.play(audio, sample_rate)
+                    sd.wait()
+
+            except Exception as exc:
+                print(f"Kokoro CLI TTS failed: {exc}")
+
+
+def is_exit_command(text: str) -> bool:
+    lowered = text.lower().strip()
+    words = set(re.findall(r"\b[a-zA-Z]+\b", lowered))
+
+    if words & EXIT_WORDS:
+        return True
+
+    return any(phrase in lowered for phrase in EXIT_PHRASES)
+
+
+def has_wake_word(text: str) -> bool:
+    lowered = text.lower().strip()
+    return any(wake in lowered for wake in WAKE_WORDS)
+
+
+def strip_wake_word(text: str) -> str:
+    cleaned = text
+
+    for wake in sorted(WAKE_WORDS, key=len, reverse=True):
+        cleaned = re.sub(
+            rf"\b{re.escape(wake)}\b[:,]?\s*",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+
+    return cleaned.strip() or text.strip()
+
+def handle_user_text(user_text: str, skills: Dict[str, Dict[str, object]]) -> Tuple[str, Optional[str]]:
+    skill = route_skill(user_text, skills)
+
+    if skill:
+        skill_name = str(skill["name"])
+
+        if skill_name == "research":
+            return handle_research_skill(user_text, skill), skill_name
+
+        if skill_name == "coding":
+            return handle_coding_skill(user_text, skill), skill_name
+
+        if skill_name == "daily-brief":
+            return handle_daily_brief_skill(user_text, skill), skill_name
+
+    return handle_general(user_text), None
+
+
+def main() -> None:
+    print("Starting Jarvis OS voice loop...")
+    print("Loading Faster-Whisper base model on CPU...")
+
+    whisper_model = WhisperModel(
+        WHISPER_MODEL_SIZE,
+        device=WHISPER_DEVICE,
+        compute_type=WHISPER_COMPUTE_TYPE,
+    )
+
+    print("Loading skills...")
+    skills = load_skills()
+
+    print("Loading Kokoro TTS...")
+    speaker = KokoroSpeaker()
+
+    print("Jarvis OS is ready.")
+    print("Say 'exit' to stop.")
+
+    while True:
+        try:
+            audio_path = record_audio()
+            user_text = transcribe_audio(whisper_model, audio_path)
+
+            if not user_text:
+                print("No speech detected.")
+                continue
+
+            print(f"\nYou: {user_text}")
+
+            if is_exit_command(user_text):
+                reply = "Shutting down Jarvis OS."
+                print(f"\nJarvis: {reply}")
+                speaker.speak(reply)
+                break
+
+            if not has_wake_word(user_text):
+                print("Wake word not detected. Say 'Jarvis' before your command.")
+                continue
+
+            command_text = strip_wake_word(user_text)
+
+            reply, skill_name = handle_user_text(command_text, skills)
+
+            print(f"\nJarvis: {reply}\n")
+
+            save_gpt_response(command_text, reply, skill_name)
+            speaker.speak(reply)
+
+        except KeyboardInterrupt:
+            print("\nShutting down Jarvis OS.")
+            break
+
+        except Exception as exc:
+            print(f"Jarvis OS error: {exc}")
+
+            try:
+                speaker.speak("I ran into an error.")
+            except Exception:
+                pass
+
+            time.sleep(1)
+
+
+if __name__ == "__main__":
+    main()

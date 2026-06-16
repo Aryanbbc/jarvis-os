@@ -1,0 +1,10 @@
+faster-whisper
+sounddevice
+kokoro
+fastapi
+uvicorn
+openai
+python-dotenv
+numpy
+pydantic
+requests
